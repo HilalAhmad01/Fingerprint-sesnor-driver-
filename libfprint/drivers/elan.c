@@ -314,25 +314,74 @@ elan_process_frame_thirds (unsigned short *raw_frame,
   *frames = g_slist_prepend (*frames, frame);
 }
 
+/* Clear USB endpoint halts to recover from protocol errors or timeouts.
+ * This prevents stale data on endpoints from causing desync on subsequent
+ * commands. */
+static void
+elan_clear_usb_halt (FpDevice *dev)
+{
+  GUsbDevice *usb_dev = fpi_device_get_usb_device (dev);
+  guint8 eps[] = { ELAN_EP_CMD_OUT, ELAN_EP_CMD_IN, ELAN_EP_IMG_IN };
+
+  for (guint i = 0; i < G_N_ELEMENTS (eps); i++)
+    {
+      g_autoptr(GError) err = NULL;
+      g_usb_device_control_transfer (usb_dev,
+                                     G_USB_DEVICE_DIRECTION_HOST_TO_DEVICE,
+                                     G_USB_DEVICE_REQUEST_TYPE_STANDARD,
+                                     G_USB_DEVICE_RECIPIENT_ENDPOINT,
+                                     0x01, /* LIBUSB_REQUEST_CLEAR_FEATURE */
+                                     0x00, /* ENDPOINT_HALT */
+                                     eps[i],
+                                     NULL, 0, NULL,
+                                     1000, NULL, &err);
+      if (err)
+        {
+          fp_dbg ("failed to clear halt on ep 0x%02x: %s", eps[i], err->message);
+        }
+    }
+
+  fp_dbg ("cleared USB endpoint halts for recovery");
+}
+
 static void
 elan_submit_image (FpImageDevice *dev)
 {
   FpiDeviceElan *self = FPI_DEVICE_ELAN (dev);
-  GSList *raw_frames;
   GSList *frames = NULL;
   FpImage *img;
 
   G_DEBUG_HERE ();
 
-  raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
-
   assembling_ctx.frame_width = self->frame_width;
   assembling_ctx.frame_height = self->frame_height;
-  assembling_ctx.image_width = self->frame_width * 3 / 2;
-  g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
-  fpi_do_movement_estimation (&assembling_ctx, frames);
-  img = fpi_assemble_frames (&assembling_ctx, frames);
-  img->flags |= FPI_IMAGE_PARTIAL;
+
+  if (ELAN_IS_PRESS_SENSOR (self->dev_type))
+    {
+      /* Press mode: use a single frame directly, no movement estimation
+       * or frame assembly needed. The most recent frame (head of the
+       * reversed list) is the best one. */
+      unsigned int frame_size = self->frame_width * self->frame_height;
+      unsigned short *raw_frame = (unsigned short *) self->frames->data;
+
+      self->process_frame (raw_frame, &frames);
+
+      struct fpi_frame *single = (struct fpi_frame *) frames->data;
+      img = fp_image_new (self->frame_width, self->frame_height);
+      memcpy (img->data, single->data, frame_size);
+      img->flags |= FPI_IMAGE_V_FLIPPED | FPI_IMAGE_H_FLIPPED;
+    }
+  else
+    {
+      /* Swipe mode: assemble multiple frames with movement estimation */
+      GSList *raw_frames = g_slist_nth (self->frames, ELAN_SKIP_LAST_FRAMES);
+
+      assembling_ctx.image_width = self->frame_width * 3 / 2;
+      g_slist_foreach (raw_frames, (GFunc) self->process_frame, &frames);
+      fpi_do_movement_estimation (&assembling_ctx, frames);
+      img = fpi_assemble_frames (&assembling_ctx, frames);
+      img->flags |= FPI_IMAGE_PARTIAL;
+    }
 
   g_slist_free_full (frames, g_free);
 
@@ -557,11 +606,11 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
           fpi_image_device_report_finger_status (idev, TRUE);
           elan_run_cmd (ssm, dev, &get_image_cmd, ELAN_CMD_TIMEOUT);
         }
-      else if (self->dev_type == ELAN_0C58 && self->last_read &&
+      else if ((self->dev_type & (ELAN_0C58 | ELAN_0903)) && self->last_read &&
                (self->last_read[0] == 0x00 || self->last_read[0] == 0xaf))
         {
           /* 0x00 - not ready
-           * 0xaf - finger removed or sensor busy (seen on 0x0c58) */
+           * 0xaf - finger removed or sensor busy (seen on 0x0c58 and 0x0903) */
           fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_FINGER, 10);
         }
       else
@@ -570,7 +619,10 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
           if (fpi_device_emulation_mode_enabled (FP_DEVICE (self)))
             fpi_ssm_mark_completed (ssm);
           else
-            fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+            {
+              elan_clear_usb_halt (dev);
+              fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
+            }
         }
       break;
 
@@ -579,6 +631,11 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       if (r < 0)
         {
           fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
+        }
+      else if (ELAN_IS_PRESS_SENSOR (self->dev_type))
+        {
+          /* Press mode: a single frame is sufficient */
+          fpi_ssm_next_state (ssm);
         }
       else if (self->num_frames < ELAN_MAX_FRAMES)
         {
@@ -607,7 +664,8 @@ capture_complete (FpiSsm *ssm, FpDevice *_dev, GError *error)
       (g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT) &&
        fpi_ssm_get_cur_state (ssm) == CAPTURE_WAIT_FINGER))
     {
-      if (self->num_frames >= ELAN_MIN_FRAMES)
+      if (self->num_frames >= ELAN_MIN_FRAMES ||
+          (ELAN_IS_PRESS_SENSOR (self->dev_type) && self->num_frames >= 1))
         {
           elan_submit_image (dev);
         }
@@ -677,7 +735,7 @@ elan_need_calibration (FpiDeviceElan *elandev)
   fp_dbg ("calibration mean: %d, bg mean: %d, delta: %d", calib_mean,
           bg_mean, delta);
 
-  return delta > ELAN_CALIBRATION_MAX_DELTA ? 1 : 0;
+  return delta > ELAN_CALIBRATION_MAX_DELTA_FOR(elandev->dev_type) ? 1 : 0;
 }
 
 enum calibrate_states {
@@ -752,6 +810,7 @@ calibrate_run_state (FpiSsm *ssm, FpDevice *dev)
       else
         {
           fp_dbg ("calibration failed");
+          elan_clear_usb_halt (dev);
           fpi_ssm_mark_failed (ssm,
                                fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
                                                          "Calibration failed!"));
@@ -777,7 +836,9 @@ calibrate_run_state (FpiSsm *ssm, FpDevice *dev)
           if (self->calib_status == 0x00 &&
               self->last_read[0] == 0x01)
             self->calib_status = 0x01;
-          fpi_ssm_next_state_delayed (ssm, 50);
+          /* 0903 needs longer settling time for status transitions */
+          fpi_ssm_next_state_delayed (ssm,
+                                      (self->dev_type & ELAN_0903) ? 150 : 50);
         }
       break;
 
@@ -876,7 +937,8 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
           self->frame_height++;
           self->raw_frame_height = self->frame_height;
         }
-      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT)
+      if (self->frame_height > ELAN_MAX_FRAME_HEIGHT &&
+          !ELAN_IS_PRESS_SENSOR (self->dev_type))
         self->frame_height = ELAN_MAX_FRAME_HEIGHT;
       fp_dbg ("sensor dimensions, WxH: %dx%d", self->frame_width,
               self->raw_frame_height);
@@ -940,6 +1002,9 @@ dev_init (FpImageDevice *dev)
   switch (self->dev_type)
     {
     case ELAN_0907:
+    case ELAN_0903:
+      /* Linear normalization produces better results for press-mode
+       * captures on small sensors */
       self->process_frame = elan_process_frame_linear;
       break;
     }
@@ -1023,5 +1088,5 @@ fpi_device_elan_class_init (FpiDeviceElanClass *klass)
   img_class->deactivate = dev_deactivate;
   img_class->change_state = dev_change_state;
 
-  img_class->bz3_threshold = 24;
+  img_class->bz3_threshold = 20;
 }
