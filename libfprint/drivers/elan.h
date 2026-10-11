@@ -171,7 +171,7 @@ static const struct elan_cmd stop_cmd = {
 };
 
 static const FpIdEntry elan_id_table[] = {
-  {.vid = ELAN_VEND_ID,  .pid = 0x0903, .driver_data = ELAN_0903},
+  /* 0x0903 is a press sensor handled by the elanpress driver */
   {.vid = ELAN_VEND_ID,  .pid = 0x0907, .driver_data = ELAN_0907},
   {.vid = ELAN_VEND_ID,  .pid = 0x0c01, .driver_data = ELAN_ALL_DEV},
   {.vid = ELAN_VEND_ID,  .pid = 0x0c02, .driver_data = ELAN_ALL_DEV},
