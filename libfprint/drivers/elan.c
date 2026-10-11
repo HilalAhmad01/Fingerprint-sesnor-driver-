@@ -358,18 +358,34 @@ elan_submit_image (FpImageDevice *dev)
 
   if (ELAN_IS_PRESS_SENSOR (self->dev_type))
     {
-      /* Press mode: use a single frame directly, no movement estimation
-       * or frame assembly needed. The most recent frame (head of the
-       * reversed list) is the best one. */
+      /* Press mode: use the settled frame with 2-frame temporal averaging
+       * to reduce capacitive noise, and set flags for NBIS minutiae matching. */
       unsigned int frame_size = self->frame_width * self->frame_height;
-      unsigned short *raw_frame = (unsigned short *) self->frames->data;
+      unsigned short *raw_frame;
+      g_autofree unsigned short *avg_frame = NULL;
+
+      if (self->num_frames >= 2 && self->frames && self->frames->next)
+        {
+          unsigned short *f0 = (unsigned short *) self->frames->data;
+          unsigned short *f1 = (unsigned short *) self->frames->next->data;
+
+          avg_frame = g_malloc (frame_size * sizeof (unsigned short));
+          for (unsigned int i = 0; i < frame_size; i++)
+            avg_frame[i] = ((unsigned int) f0[i] + (unsigned int) f1[i]) / 2;
+          raw_frame = avg_frame;
+        }
+      else
+        {
+          raw_frame = (unsigned short *) self->frames->data;
+        }
 
       self->process_frame (raw_frame, &frames);
 
       struct fpi_frame *single = (struct fpi_frame *) frames->data;
       img = fp_image_new (self->frame_width, self->frame_height);
       memcpy (img->data, single->data, frame_size);
-      img->flags |= FPI_IMAGE_V_FLIPPED | FPI_IMAGE_H_FLIPPED;
+      img->flags |= FPI_IMAGE_COLORS_INVERTED | FPI_IMAGE_PARTIAL |
+                    FPI_IMAGE_V_FLIPPED | FPI_IMAGE_H_FLIPPED;
     }
   else
     {
@@ -634,8 +650,17 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
         }
       else if (ELAN_IS_PRESS_SENSOR (self->dev_type))
         {
-          /* Press mode: a single frame is sufficient */
-          fpi_ssm_next_state (ssm);
+          /* Press mode: collect up to 4 frames so the touch has settled firmly.
+           * Natural finger contact achieves full area after 100-150ms. */
+          if (self->num_frames < 4)
+            {
+              self->cmd_timeout = ELAN_FINGER_TIMEOUT;
+              fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_FINGER);
+            }
+          else
+            {
+              fpi_ssm_next_state (ssm);
+            }
         }
       else if (self->num_frames < ELAN_MAX_FRAMES)
         {
@@ -1002,11 +1027,16 @@ dev_init (FpImageDevice *dev)
   switch (self->dev_type)
     {
     case ELAN_0907:
-    case ELAN_0903:
-      /* Linear normalization produces better results for press-mode
-       * captures on small sensors */
       self->process_frame = elan_process_frame_linear;
       break;
+    }
+
+  if (ELAN_IS_PRESS_SENSOR (self->dev_type))
+    {
+      /* 7 enroll stages provide greater template coverage for small sensors */
+      fpi_device_set_nr_enroll_stages (FP_DEVICE (dev), 7);
+      /* Lower threshold accommodates smaller contact area */
+      fpi_image_device_set_bz3_threshold (dev, 14);
     }
 
   fpi_image_device_open_complete (dev, NULL);
@@ -1088,5 +1118,5 @@ fpi_device_elan_class_init (FpiDeviceElanClass *klass)
   img_class->deactivate = dev_deactivate;
   img_class->change_state = dev_change_state;
 
-  img_class->bz3_threshold = 20;
+  img_class->bz3_threshold = 16;
 }
