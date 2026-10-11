@@ -253,13 +253,18 @@ fpi_print_bz3_match (FpPrint *print_template,
   pstruct = g_ptr_array_index (print->prints, 0);
   probe_len = bozorth_probe_init (pstruct);
 
+  if (probe_len < MIN_COMPUTABLE_BOZORTH_MINUTIAE)
+    g_message ("bozorth3: probe has only %d minutiae (minimum required: %d)",
+               probe_len, MIN_COMPUTABLE_BOZORTH_MINUTIAE);
+
   for (i = 0; i < print_template->prints->len; i++)
     {
       struct xyt_struct *gstruct;
       gint score;
       gstruct = g_ptr_array_index (print_template->prints, i);
       score = bozorth_to_gallery (probe_len, pstruct, gstruct);
-      fp_dbg ("score %d/%d", score, bz3_threshold);
+      g_message ("bozorth3: score %d / threshold %d (sample %d of %d, probe minutiae: %d, gallery minutiae: %d)",
+                 score, bz3_threshold, i + 1, print_template->prints->len, probe_len, gstruct->nrows);
 
       if (score >= bz3_threshold)
         return FPI_MATCH_SUCCESS;
