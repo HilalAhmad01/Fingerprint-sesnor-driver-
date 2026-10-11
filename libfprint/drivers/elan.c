@@ -1051,7 +1051,7 @@ dev_deinit (FpImageDevice *dev)
   G_DEBUG_HERE ();
 
   elan_dev_reset_state (self);
-  g_free (self->background);
+  g_clear_pointer (&self->background, g_free);
   g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
                                   0, 0, &error);
   fpi_image_device_close_complete (dev, error);
@@ -1071,12 +1071,17 @@ dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
 
   G_DEBUG_HERE ();
 
-  /* Note: We always calibrate even if that may not be needed always.
-   * Doing this for each capture appears to make it at least less likely for
-   * devices to end up in a bad state.
-   */
+  /* Note: Upstream always calibrates on every capture.
+   * For press sensors (0903), re-calibrating while a finger is touching
+   * ruins background subtraction and causes "Calibration failed!".
+   * Only calibrate when we don't have a background frame yet. */
   if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
-    elan_calibrate (self);
+    {
+      if (!self->background || !ELAN_IS_PRESS_SENSOR (self->dev_type))
+        elan_calibrate (self);
+      else
+        elan_capture (self);
+    }
 }
 
 static void
