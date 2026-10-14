@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply fingerprint PAM configuration
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/fprint-elanpress/fprint-pam-apply
+
+[Install]
+WantedBy=multi-user.target

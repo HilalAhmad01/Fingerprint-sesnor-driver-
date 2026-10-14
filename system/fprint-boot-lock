@@ -1,0 +1,49 @@
+#!/bin/bash
+# Locks an autologin session as soon as the shell can show the lock screen,
+# so that boot ends at a fingerprint prompt, and fails closed: if the lock
+# screen is not up within the time limits, the session is terminated, which
+# returns to the SDDM greeter (password).
+#
+# Sessions started by typing a password at the greeter are left alone; the
+# user has just authenticated.
+#
+# Started from Hyprland's autostart, as the user.
+
+SHELL_WAIT_S=30
+LOCK_WAIT_S=10
+
+log() { logger -t fprint-boot-lock -- "$*" 2>/dev/null; }
+
+session=${XDG_SESSION_ID:-}
+[[ -n $session ]] || session=$(loginctl show-user "$USER" -p Display --value 2>/dev/null)
+if [[ -z $session ]]; then
+  log "cannot determine the login session, not locking"
+  exit 0
+fi
+
+service=$(loginctl show-session "$session" -p Service --value 2>/dev/null)
+if [[ $service != sddm-autologin ]]; then
+  exit 0
+fi
+
+fail_closed() {
+  log "lock screen not confirmed ($1), terminating autologin session $session"
+  loginctl terminate-session "$session"
+  exit 1
+}
+
+deadline=$((SECONDS + SHELL_WAIT_S))
+until omarchy-shell shell ping >/dev/null 2>&1; do
+  (( SECONDS < deadline )) || fail_closed "shell did not start within ${SHELL_WAIT_S}s"
+  sleep 0.05
+done
+
+[[ $(omarchy-shell lock isLocked 2>/dev/null) == true ]] || omarchy system lock
+
+deadline=$((SECONDS + LOCK_WAIT_S))
+until [[ $(omarchy-shell lock isLocked 2>/dev/null) == true ]]; do
+  (( SECONDS < deadline )) || fail_closed "lock not engaged within ${LOCK_WAIT_S}s"
+  sleep 0.1
+done
+
+log "autologin session $session locked"

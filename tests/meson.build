@@ -324,6 +324,25 @@ endif
 
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
 
+# the elanpress matcher only needs glib, so it is built from its sources
+if 'elanpress' in drivers
+    test_elanpress_match = executable('test-elanpress-match',
+        sources: [
+            'test-elanpress-match.c',
+            '../libfprint/drivers/elanpress-match.c',
+            '../libfprint/drivers/elanpress-sift.c',
+        ],
+        include_directories: include_directories('../libfprint/drivers'),
+        dependencies: [ glib_dep, mathlib_dep ],
+        c_args: common_cflags,
+        install: false,
+    )
+    test('elanpress-match',
+        test_elanpress_match,
+        suite: ['unit-tests'],
+    )
+endif
+
 foreach test_name: unit_tests
     if unit_tests_deps.has_key(test_name)
         missing_deps = false

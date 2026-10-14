@@ -332,6 +332,7 @@ endif
 
 subdir('data')
 subdir('tests')
+subdir('tools')
 
 subdir('examples')
 

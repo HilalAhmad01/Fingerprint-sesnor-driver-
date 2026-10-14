@@ -1,0 +1,50 @@
+# Local package for this libfprint fork (elan + elanpress drivers).
+#
+# Replaces libfprint / libfprint-git through pacman, instead of `ninja install`
+# over a package's files with NoExtract/IgnorePkg holding pacman off: pacman
+# keeps owning every installed file, upgrades of everything else stay
+# consistent, and `pacman -R libfprint-elanpress` + `pacman -S libfprint`
+# rolls back cleanly.
+#
+# Built from the working tree this file lives in:
+#   cd packaging/arch && makepkg -f
+
+pkgname=libfprint-elanpress
+pkgver=1.94.100.elanpress.202610142115.g4ec2ab7
+pkgrel=1
+pkgdesc="libfprint with the elanpress driver for ELAN 04f3:0903 press-type sensors"
+arch=(x86_64)
+url="https://gitlab.freedesktop.org/libfprint/libfprint"
+license=(LGPL-2.1-or-later)
+depends=(glib2 glibc gcc-libs libgusb systemd-libs)
+makedepends=(meson ninja gobject-introspection)
+provides=(libfprint "libfprint-2.so=2-64")
+conflicts=(libfprint libfprint-git)
+options=(!debug)
+
+_src="$startdir/../.."
+
+pkgver() {
+  local base rev
+  base=$(sed -n "s/^ *version: '\(.*\)',$/\1/p" "$_src/meson.build" | head -1)
+  rev=$(git -C "$_src" rev-parse --short HEAD 2>/dev/null || echo local)
+  # uncommitted changes still get a distinct, increasing version
+  echo "${base}.elanpress.$(date +%Y%m%d%H%M).g${rev}"
+}
+
+build() {
+  arch-meson "$_src" build \
+    -Ddrivers=elan,elanpress \
+    -Ddoc=false \
+    -Dgtk-examples=false \
+    -Dinstalled-tests=false
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --suite unit-tests --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

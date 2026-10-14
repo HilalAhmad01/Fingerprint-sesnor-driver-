@@ -1,0 +1,167 @@
+#!/bin/bash
+# Applies the fingerprint PAM configuration for the elanpress driver.
+#
+# Idempotent: files are only written when their content changes. Run by the
+# setup script, at boot, and by fprint-pam-guard.path whenever one of the
+# files is rewritten (omarchy-apply-lock rewrites the lock screen stacks on
+# Omarchy updates, and omarchy-setup-security-fingerprint edits sudo/polkit).
+#
+# Policy:
+#  - Lock screen: fingerprint, one press per PAM session. Five rejected
+#    presses in a row disable fingerprint until the password unlocks.
+#  - sudo / polkit: password only, unless FINGERPRINT_SUDO=1 in the config,
+#    in which case fingerprint first with its own lockout, then password.
+#  - SDDM: password only. pam_fprintd ahead of pam_unix made a typed password
+#    wait for the fingerprint timeout; boot goes through autologin + lock.
+set -euo pipefail
+umask 022
+
+CONF=/etc/fprint-elanpress.conf
+LIB=/usr/local/lib/fprint-elanpress
+TALLY=/var/lib/fprint-faillock
+LOCK_DIR=$TALLY/lock
+ADMIN_DIR=$TALLY/admin
+FL="deny=5 unlock_time=never fail_interval=604800"
+GATE=/usr/bin/omarchy-hw-laptop-closed
+
+(( EUID == 0 )) || { echo "fprint-pam-apply: must run as root" >&2; exit 1; }
+
+conf_get() {
+  [[ -r $CONF ]] || return 0
+  sed -n "s/^$1=\(.*\)$/\1/p" "$CONF" | tail -1
+}
+
+FINGERPRINT_SUDO=$(conf_get FINGERPRINT_SUDO)
+LOCK_USER=$(conf_get LOCK_USER)
+[[ $FINGERPRINT_SUDO == 1 ]] || FINGERPRINT_SUDO=0
+if [[ ! $LOCK_USER =~ ^[a-z_][a-z0-9_-]*$ ]] || ! id "$LOCK_USER" >/dev/null 2>&1; then
+  echo "fprint-pam-apply: LOCK_USER missing or invalid in $CONF" >&2
+  exit 1
+fi
+
+# The lock screen runs PAM as the user, and pam_faillock silently does
+# nothing when it cannot write its tally, so the lock screen's tally lives in
+# a directory the user owns. sudo and polkit run as root and keep theirs
+# separately, root-only.
+install -d -m 0755 -o root -g root "$TALLY"
+install -d -m 0700 -o root -g root "$ADMIN_DIR"
+install -d -m 0700 -o "$LOCK_USER" -g "$LOCK_USER" "$LOCK_DIR"
+
+write_if_changed() {
+  local file=$1 tmp
+  tmp=$(mktemp)
+  cat >"$tmp"
+  if [[ ! -f $file ]] || ! cmp -s "$tmp" "$file"; then
+    install -m 0644 -o root -g root "$tmp" "$file"
+    echo "fprint-pam-apply: updated $file"
+  fi
+  rm -f "$tmp"
+}
+
+# drop our marked blocks and any fingerprint lines another tool added
+strip_fingerprint() {
+  awk '
+    /^# BEGIN fprint-elanpress/ { skip = 1; next }
+    /^# END fprint-elanpress/   { skip = 0; next }
+    skip { next }
+    /pam_fprintd\.so|omarchy-hw-laptop-closed/ { next }
+    { print }
+  ' "$1"
+}
+
+# insert $2 before the first auth line and $3 after the last one
+insert_around_auth() {
+  awk -v pre="$2" -v post="$3" '
+    { line[NR] = $0 }
+    /^[[:space:]]*-?auth[[:space:]]/ { if (!first) first = NR; last = NR }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (i == first && pre != "") print pre
+        print line[i]
+        if (i == last && post != "") print post
+      }
+    }
+  ' "$1"
+}
+
+admin_block="# BEGIN fprint-elanpress
+# Fingerprint first, then password. Five rejected fingerprints in a row
+# disable fingerprint here until the password is used.
+auth      [success=4 default=ignore]                          pam_exec.so quiet $GATE
+auth      [success=ignore default=3]                          pam_faillock.so preauth silent dir=$ADMIN_DIR $FL
+auth      [success=1 auth_err=ignore maxtries=ignore default=2] pam_fprintd.so max-tries=1
+auth      [default=1]                                         pam_faillock.so authfail dir=$ADMIN_DIR $FL
+auth      [success=done default=ignore]                       pam_faillock.so authsucc dir=$ADMIN_DIR $FL
+# END fprint-elanpress"
+
+admin_reset="# BEGIN fprint-elanpress reset
+auth      optional  pam_exec.so quiet $LIB/fprint-faillock-reset $ADMIN_DIR
+# END fprint-elanpress reset"
+
+# --- lock screen, fingerprint ---
+write_if_changed /etc/pam.d/omarchy-lock-fingerprint <<EOF
+#%PAM-1.0
+# Managed by fprint-pam-apply (fprint-elanpress). Omarchy rewrites this file
+# on updates; fprint-pam-guard.path puts it back.
+#
+# One press per PAM session; the lock screen starts a new session after each
+# one. Five rejected presses in a row disable fingerprint until the password
+# unlocks the screen (see omarchy-lock-password). Sensor errors are not
+# counted.
+#
+# A rejected press has to mark the stack failed itself (auth_err=bad):
+# pam_faillock authfail records the failure but returns PAM_IGNORE, so on its
+# own it would let the stack fall through to authsucc and succeed.
+#
+# timeout=-1 keeps the session open for as long as the lock screen
+# waits, instead of tearing it down and reopening the sensor every 30 s.
+auth      [success=1 default=ignore]                          pam_faillock.so preauth silent dir=$LOCK_DIR $FL
+auth      requisite                                           pam_exec.so quiet $LIB/fprint-locked-out
+auth      [success=1 auth_err=bad maxtries=bad default=die]   pam_fprintd.so max-tries=1 timeout=-1
+auth      [default=die]                                       pam_faillock.so authfail dir=$LOCK_DIR $FL
+auth      required                                            pam_faillock.so authsucc dir=$LOCK_DIR $FL
+account   include                                             system-local-login
+EOF
+
+# --- lock screen, password: a successful unlock lifts a fingerprint lockout ---
+if [[ -f /etc/pam.d/omarchy-lock-password ]]; then
+  strip_fingerprint /etc/pam.d/omarchy-lock-password |
+    insert_around_auth /dev/stdin "" "# BEGIN fprint-elanpress reset
+auth       optional                    pam_exec.so quiet $LIB/fprint-faillock-reset $LOCK_DIR
+# END fprint-elanpress reset" |
+    write_if_changed /etc/pam.d/omarchy-lock-password
+fi
+
+# --- sudo ---
+if [[ -f /etc/pam.d/sudo ]]; then
+  if (( FINGERPRINT_SUDO )); then
+    strip_fingerprint /etc/pam.d/sudo |
+      insert_around_auth /dev/stdin "$admin_block" "$admin_reset" |
+      write_if_changed /etc/pam.d/sudo
+  else
+    strip_fingerprint /etc/pam.d/sudo | write_if_changed /etc/pam.d/sudo
+  fi
+fi
+
+# --- polkit: the vendor stack (/usr/lib/pam.d/polkit-1), which Omarchy's
+# fingerprint setup had replaced with a bare pam_unix stack that skipped
+# system-auth and with it pam_faillock ---
+{
+  echo "#%PAM-1.0"
+  echo "# Managed by fprint-pam-apply (fprint-elanpress)."
+  if (( FINGERPRINT_SUDO )); then
+    echo "$admin_block"
+  fi
+  echo "auth       include      system-auth"
+  if (( FINGERPRINT_SUDO )); then
+    echo "$admin_reset"
+  fi
+  echo "account    include      system-auth"
+  echo "password   include      system-auth"
+  echo "session    include      system-auth"
+} | write_if_changed /etc/pam.d/polkit-1
+
+# --- SDDM: password only ---
+if [[ -f /etc/pam.d/sddm ]]; then
+  strip_fingerprint /etc/pam.d/sddm | write_if_changed /etc/pam.d/sddm
+fi

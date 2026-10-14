@@ -1,0 +1,12 @@
+[Unit]
+Description=Re-apply fingerprint PAM configuration when it is rewritten
+
+[Path]
+PathChanged=/etc/pam.d/omarchy-lock-fingerprint
+PathChanged=/etc/pam.d/omarchy-lock-password
+PathChanged=/etc/pam.d/sudo
+PathChanged=/etc/pam.d/polkit-1
+PathChanged=/etc/pam.d/sddm
+
+[Install]
+WantedBy=multi-user.target

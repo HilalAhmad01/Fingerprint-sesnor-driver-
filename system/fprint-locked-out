@@ -1,0 +1,6 @@
+#!/bin/sh
+# Called from PAM while fingerprint is locked out after too many rejected
+# presses. The lock screen restarts its fingerprint session as soon as one
+# fails, so failing immediately would spin; wait a while first.
+sleep 10
+exit 1

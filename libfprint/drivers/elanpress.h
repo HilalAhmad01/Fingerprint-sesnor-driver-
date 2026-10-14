@@ -38,17 +38,30 @@
 #define ELANPRESS_CMD_TIMEOUT 5000
 #define ELANPRESS_FRAME_TIMEOUT 2000
 
-/* interval between polls while frames of a touch are being collected */
-#define ELANPRESS_POLL_INTERVAL_MS 30
+/* the stop command is sent synchronously on the main loop when an action
+ * ends; a wedged sensor must not stall fprintd for the full command timeout */
+#define ELANPRESS_STOP_TIMEOUT 500
 
-/* interval between polls while waiting for a finger to land or lift. Each
- * poll pulls a whole frame rather than the single status byte it used to, so
- * the transfer already paces the loop; a further delay on top of it only
- * adds latency to noticing the finger. */
+/* stale image data left on the image endpoint (from an action that ended
+ * mid-frame in an older build, or a crashed fprintd) is read off at open with
+ * this timeout per attempt, so the first poll does not receive half a frame */
+#define ELANPRESS_DRAIN_TIMEOUT 25
+#define ELANPRESS_DRAIN_MAX_READS 4
+
+/* Waiting for a finger: each poll pulls a whole frame, so the transfer
+ * already paces the loop. Right after the action starts, or after a touch,
+ * polls follow each other almost back to back, since that is when a finger
+ * is most likely to land. Once the sensor has read clear for
+ * ELANPRESS_IDLE_FAST_POLLS polls (a few seconds), the loop backs off to
+ * ELANPRESS_IDLE_SLOW_POLL_MS between polls, which roughly halves the USB and
+ * CPU load of a lock screen sitting idle for hours, for at most that many
+ * milliseconds of extra latency on the next touch. */
 #define ELANPRESS_IDLE_POLL_INTERVAL_MS 5
+#define ELANPRESS_IDLE_SLOW_POLL_MS 20
+#define ELANPRESS_IDLE_FAST_POLLS 150
 
 /* consecutive untouched frames that end a touch. Presence is inferred from
- * the image itself (see ELANPRESS_TOUCH_MIN_MEAN_DELTA) rather than asked of
+ * the image itself (see ELANPRESS_TOUCH_MIN_COVERAGE) rather than asked of
  * cmd_pre_scan, whose status byte answers once per power-up and then wedges
  * at "finger present" for good, stranding capture in a wait-for-lift loop
  * that only a full power cycle could clear. Requiring a run of clear frames
@@ -56,22 +69,41 @@
  * resting on the sensor from being counted as the next press. */
 #define ELANPRESS_FINGER_OFF_FRAMES 10
 
+/* reopening the device within this long of closing it keeps waiting for the
+ * last imaged finger to lift (see FpiDeviceElanPress.closed_at_us) */
+#define ELANPRESS_REOPEN_HOLD_MS 5000
+
 /* consecutive clear polls after which the background frame is retaken while
- * waiting for a press. The background is the only reference for telling a
- * touch apart, so one captured while a finger happened to be resting would
- * make every later frame look untouched and strand capture just as the
- * wedged status byte used to. Retaking it on a long clear stretch recovers
- * from that by itself, and otherwise just tracks the sensor's drift. */
+ * waiting for a press, to follow the sensor's drift. A background that has a
+ * finger in it is caught much sooner than this: the first frame after the
+ * finger lifts reads darker than it (see ElanpressTouchStats.neg_coverage). */
 #define ELANPRESS_BG_REFRESH_FRAMES 50
 
-/* a touch is imaged once, ELANPRESS_SETTLE_MS after the finger is first
- * detected. The sensor's frames are nearly noise-free (consecutive frames of
- * a resting finger correlate at 0.999), so averaging several buys nothing,
- * but it does smear the ridges whenever the finger shifts while resting: on
- * recorded presses that happened in about one press in ten, between 170 ms
- * and 900 ms after landing, and averaged frames from such presses failed to
- * match where a single frame of the same press did. */
-#define ELANPRESS_MAX_FRAMES 1
+/* a "touch" that has not lifted after this long, while waiting for the
+ * sensor to read clear, is taken to be a background gone stale (drift after
+ * a long idle or a resume) rather than a finger, and becomes the new
+ * background. A finger really resting that long is absorbed into the
+ * background, and recovered from as soon as it lifts. */
+#define ELANPRESS_STUCK_TOUCH_MS 10000
+
+/* When the finger is imaged.
+ *
+ * The first frames of a touch catch the finger still landing, with only part
+ * of it in contact; from about 100 ms on the image is as good as any later
+ * one. Rather than wait a fixed time, every frame of the touch is looked at
+ * as it arrives, and the touch is imaged as soon as its contact area stops
+ * growing: once ELANPRESS_SETTLE_MIN_MS have passed and the covered share of
+ * the sensor changed by at most ELANPRESS_SETTLE_COVERAGE_DELTA since the
+ * previous frame. A firm press settles in two or three frames. A touch still
+ * changing at ELANPRESS_SETTLE_MAX_MS is imaged then regardless.
+ *
+ * A tap that lifts before settling is not thrown away: the frame with the
+ * largest contact area seen during it is used. Before, the finger had to stay
+ * down for the whole fixed settle delay or the touch was silently dropped,
+ * which is exactly what a light tap does. */
+#define ELANPRESS_SETTLE_MIN_MS 40
+#define ELANPRESS_SETTLE_MAX_MS 150
+#define ELANPRESS_SETTLE_COVERAGE_DELTA 0.03
 
 /* number of touches stored during enrollment. The sensor sees a different
  * part of the finger on each press, and a press only matches an enrolled one
@@ -80,45 +112,36 @@
  * touches, 1 in 80 against 12 and 1 in 170 against 16. */
 #define ELANPRESS_ENROLL_STAGES 12
 
-/* time between detecting the finger and imaging it. The first frames catch it
- * still landing, with only part of it in contact; from about 100 ms on the
- * image is as good as any later one. */
-#define ELANPRESS_SETTLE_MS 200
-
-/* separate presses averaged into one verify/identify decision.
- *
- * Resampling until some press cleared the threshold made the verdict the best
- * of everything tried: the best of several presses, each scored against the
- * best of the enrolled images, each of those the best over a few thousand
- * candidate alignments. A maximum taken over that many chances lifts a
- * stranger's score about as readily as the owner's, which is the likely
- * reason the driver has been reported as accepting any finger.
- *
- * Dropping that loop is what fixed it, not the averaging. A single press
- * already sits clearly either side of the threshold (see
- * ELANPRESS_MATCH_MIN_PAIRS), so averaging further presses only buys margin
- * against an unusually poor genuine one, and on a lockscreen that margin is
- * better spent on convenience: a false reject there costs one more press,
- * whereas a second mandatory press costs one every single time. Raise this
- * if the score distributions on some other sensor turn out to sit closer
- * together. */
-#define ELANPRESS_MATCH_SAMPLES 1
-
-/* extra presses allowed when one yields no usable image at all: too few
- * frames, or too little contrast to be worth scoring. These do not count
- * towards the average, because a press that produced nothing is not evidence
+/* extra presses allowed when one yields no usable image at all: too little
+ * contrast to be worth scoring. A press that produced nothing is not evidence
  * either way, whereas one that produced a poor score is. */
 #define ELANPRESS_MATCH_MAX_RETRIES 3
 
-/* version tag for the serialized print data */
-#define ELANPRESS_PRINT_VERSION 1
+/* a USB error during capture (a stalled endpoint, a timeout after resume) is
+ * recovered from by clearing the endpoint halts and starting the capture over,
+ * this many times per action, before the error is reported */
+#define ELANPRESS_MAX_RECOVERIES 2
+
+/* version tags for the serialized print data. Version 1 stored the enrolled
+ * images themselves and is still read, so existing enrollments keep working,
+ * but a print is only ever written as version 2: the SIFT keypoints of each
+ * enrolled image, no image. Re-enrolling replaces a version 1 print. */
+#define ELANPRESS_PRINT_VERSION_IMAGES 1
+#define ELANPRESS_PRINT_VERSION 2
+
+/* when set in fprintd's environment, every processed touch is written there
+ * as a PGM image, for measuring score distributions with
+ * tools/elanpress-eval. These are pictures of fingerprints: only ever set it
+ * for a measurement session, and delete the directory afterwards. */
+#define ELANPRESS_DUMP_DIR_ENV "ELANPRESS_DUMP_DIR"
 
 G_DECLARE_FINAL_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FPI,
                       DEVICE_ELANPRESS, FpDevice);
 
+/* 0c4f and 0c6e, listed here originally, are also claimed by the elan swipe
+ * driver; two drivers claiming one ID with equal score leaves the choice to
+ * registration order. Only the sensor this driver is tested with is claimed. */
 static const FpIdEntry elanpress_id_table[] = {
-  {.vid = ELANPRESS_VEND_ID, .pid = 0x0c6e, }, /* 04f3:0c6e Rog Flow x13 etc. */
-  {.vid = ELANPRESS_VEND_ID, .pid = 0x0c4f, }, /* 04f3:0c4f Acer Aspire A515-45 */
   {.vid = ELANPRESS_VEND_ID, .pid = 0x0903, }, /* 04f3:0903 ASUS VivoBook 16X */
   {.vid = 0, .pid = 0, },
 };

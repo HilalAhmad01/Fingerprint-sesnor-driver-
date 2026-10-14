@@ -32,13 +32,9 @@
 #define ELAN_0C03 (1 << 1)
 #define ELAN_0C42 (1 << 2)
 #define ELAN_0C58 (1 << 3)
-#define ELAN_0903 (1 << 4)
 
 /* devices which don't require frame rotation before assembling */
 #define ELAN_NOT_ROTATED ELAN_0C03
-
-/* devices that use press/touch mode instead of swipe */
-#define ELAN_IS_PRESS_SENSOR(dev_type) ((dev_type) & ELAN_0903)
 
 /* min FW version that supports calibration */
 #define ELAN_MIN_CALIBRATION_FW 0x0138
@@ -51,11 +47,7 @@
  * generally prevents calibration from looping indefinitely */
 #define ELAN_DEFAULT_CALIBRATION_ATTEMPTS 10
 #define ELAN_CALIBRATION_ATTEMPTS(dev_type) \
-  (((dev_type) & (ELAN_0C58 | ELAN_0903)) ? 30 : ELAN_DEFAULT_CALIBRATION_ATTEMPTS)
-
-/* per-device calibration delta: 0903 needs a more relaxed threshold */
-#define ELAN_CALIBRATION_MAX_DELTA_FOR(dev_type) \
-  (((dev_type) & ELAN_0903) ? 1000 : ELAN_CALIBRATION_MAX_DELTA)
+  ((dev_type) == ELAN_0C58 ? 30 : ELAN_DEFAULT_CALIBRATION_ATTEMPTS)
 
 /* min and max frames in a capture */
 #define ELAN_MIN_FRAMES 7
@@ -171,7 +163,7 @@ static const struct elan_cmd stop_cmd = {
 };
 
 static const FpIdEntry elan_id_table[] = {
-  /* 0x0903 is a press sensor handled by the elanpress driver */
+  /* 0x0903 is a press sensor, handled by the elanpress driver */
   {.vid = ELAN_VEND_ID,  .pid = 0x0907, .driver_data = ELAN_0907},
   {.vid = ELAN_VEND_ID,  .pid = 0x0c01, .driver_data = ELAN_ALL_DEV},
   {.vid = ELAN_VEND_ID,  .pid = 0x0c02, .driver_data = ELAN_ALL_DEV},

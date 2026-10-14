@@ -74,52 +74,28 @@ elanpress_normalize (const unsigned short *in, guint8 *out, unsigned int size)
     }
 }
 
-/* average the stable frames of a touch (newest-first list), subtract the
- * background and normalize; returns NULL if the finger wasn't properly on
- * the sensor */
+/* subtract the background from the frame a touch was imaged with and
+ * normalize it; returns NULL if the finger wasn't properly on the sensor.
+ * Frames are not averaged: they are nearly noise-free, and averaging smears
+ * the ridges whenever the finger shifts while resting. */
 guint8 *
-elanpress_process_frames (GSList *frames, int num_frames,
-                          const unsigned short *background,
-                          unsigned int size)
+elanpress_process_frame (const unsigned short *frame,
+                         const unsigned short *background,
+                         unsigned int          size)
 {
-  g_autofree unsigned int *sum = g_malloc0 (size * sizeof (unsigned int));
-  g_autofree unsigned short *avg = g_malloc (size * sizeof (unsigned short));
+  g_autofree unsigned short *avg = NULL;
   guint8 *out;
-  int skip_oldest = 0, skip_newest = 0, used = 0, i;
   unsigned long total = 0;
-  GSList *l;
 
-  if (num_frames >= 6)
-    {
-      skip_oldest = ELANPRESS_SKIP_OLDEST;
-      skip_newest = ELANPRESS_SKIP_NEWEST;
-    }
-  else if (num_frames >= 4)
-    {
-      skip_oldest = 1;
-      skip_newest = 1;
-    }
-
-  for (l = frames, i = 0; l; l = l->next, i++)
-    {
-      const unsigned short *frame = l->data;
-
-      if (i < skip_newest || i >= num_frames - skip_oldest)
-        continue;
-      for (unsigned int j = 0; j < size; j++)
-        sum[j] += frame[j];
-      used++;
-    }
-
-  if (used == 0)
+  if (!frame || size == 0)
     return NULL;
 
+  avg = g_malloc (size * sizeof (unsigned short));
   for (unsigned int j = 0; j < size; j++)
     {
-      unsigned int px = sum[j] / used;
       unsigned short bg = background ? background[j] : 0;
 
-      avg[j] = px > bg ? px - bg : 0;
+      avg[j] = frame[j] > bg ? frame[j] - bg : 0;
       total += avg[j];
     }
 
@@ -169,12 +145,13 @@ elanpress_frame_has_touch (const unsigned short *frame,
                            ElanpressTouchStats *stats)
 {
   gint64 sum = 0;
-  unsigned int covered = 0;
+  unsigned int covered = 0, uncovered = 0;
 
   if (stats)
     {
       stats->mean_delta = 0;
       stats->coverage = 0;
+      stats->neg_coverage = 0;
     }
 
   /* without a reference frame presence cannot be told apart from an evenly
@@ -186,6 +163,8 @@ elanpress_frame_has_touch (const unsigned short *frame,
     {
       int d = (int) frame[i] - (int) background[i];
 
+      if (d <= -ELANPRESS_TOUCH_PIXEL_DELTA)
+        uncovered++;
       if (d <= 0)
         continue;
 
@@ -198,6 +177,7 @@ elanpress_frame_has_touch (const unsigned short *frame,
     {
       stats->mean_delta = (gdouble) sum / size;
       stats->coverage = (gdouble) covered / size;
+      stats->neg_coverage = (gdouble) uncovered / size;
     }
 
   return covered >= size * ELANPRESS_TOUCH_MIN_COVERAGE;
@@ -327,6 +307,35 @@ elanpress_count_distinct (const ElanpressPair *pairs, const gboolean *fit, guint
   return MIN (probe, enrolled);
 }
 
+/* RMS distance of the fitting pairs' probe keypoints from their centroid */
+static gdouble
+elanpress_fit_spread (const ElanpressPair *pairs, const gboolean *fit, guint n)
+{
+  gdouble mx = 0, my = 0, ss = 0;
+  guint cnt = 0;
+
+  for (guint i = 0; i < n; i++)
+    if (fit[i])
+      {
+        mx += pairs[i].px;
+        my += pairs[i].py;
+        cnt++;
+      }
+  if (cnt == 0)
+    return 0;
+  mx /= cnt;
+  my /= cnt;
+
+  for (guint i = 0; i < n; i++)
+    if (fit[i])
+      {
+        gdouble dx = pairs[i].px - mx, dy = pairs[i].py - my;
+
+        ss += dx * dx + dy * dy;
+      }
+  return sqrt (ss / cnt);
+}
+
 /* the number of keypoint pairs that agree on one rigid placement of the
  * probe on the enrolled image.
  *
@@ -439,8 +448,95 @@ elanpress_match_features (const ElanpressFeatures *probe,
         }
 
       cnt = elanpress_count_distinct (pairs, fit, n);
+      if (cnt > best &&
+          elanpress_fit_spread (pairs, fit, n) < ELANPRESS_MATCH_MIN_SPREAD_PX)
+        continue;
       best = MAX (best, cnt);
     }
 
   return best;
+}
+
+static void
+elanpress_put_f32 (guint8 *p, gfloat v)
+{
+  guint32 u;
+
+  memcpy (&u, &v, sizeof (u));
+  u = GUINT32_TO_LE (u);
+  memcpy (p, &u, sizeof (u));
+}
+
+static gfloat
+elanpress_get_f32 (const guint8 *p)
+{
+  guint32 u;
+  gfloat v;
+
+  memcpy (&u, p, sizeof (u));
+  u = GUINT32_FROM_LE (u);
+  memcpy (&v, &u, sizeof (v));
+  return v;
+}
+
+/* the keypoints of one enrolled image as stored in a print. Storing these
+ * instead of the image keeps a picture of the fingerprint off the disk, and
+ * spares running SIFT over every enrolled image on every verify. */
+guint8 *
+elanpress_features_pack (const ElanpressFeatures *features, gsize *len)
+{
+  guint8 *out, *p;
+
+  *len = (gsize) features->n * ELANPRESS_PACKED_KP_LEN;
+  /* an image without a single keypoint still needs a valid, empty blob */
+  out = p = g_malloc (MAX (*len, 1));
+
+  for (guint i = 0; i < features->n; i++)
+    {
+      const ElanpressKeypoint *kp = &features->kp[i];
+
+      elanpress_put_f32 (p, kp->x);
+      elanpress_put_f32 (p + 4, kp->y);
+      elanpress_put_f32 (p + 8, kp->angle);
+      memcpy (p + 12, kp->desc, ELANPRESS_SIFT_DESC_LEN);
+      p += ELANPRESS_PACKED_KP_LEN;
+    }
+
+  return out;
+}
+
+/* NULL if the data is not a plausible keypoint set for a w x h image */
+ElanpressFeatures *
+elanpress_features_unpack (const guint8 *data, gsize len, int w, int h)
+{
+  g_autoptr(ElanpressFeatures) f = NULL;
+  gsize n;
+
+  if (len % ELANPRESS_PACKED_KP_LEN != 0)
+    return NULL;
+  n = len / ELANPRESS_PACKED_KP_LEN;
+  if (n > ELANPRESS_MAX_KEYPOINTS)
+    return NULL;
+
+  f = g_new0 (ElanpressFeatures, 1);
+  f->kp = g_new0 (ElanpressKeypoint, MAX (n, 1));
+  f->n = n;
+
+  for (gsize i = 0; i < n; i++)
+    {
+      const guint8 *p = data + i * ELANPRESS_PACKED_KP_LEN;
+      ElanpressKeypoint *kp = &f->kp[i];
+
+      kp->x = elanpress_get_f32 (p);
+      kp->y = elanpress_get_f32 (p + 4);
+      kp->angle = elanpress_get_f32 (p + 8);
+      memcpy (kp->desc, p + 12, ELANPRESS_SIFT_DESC_LEN);
+
+      if (!isfinite (kp->x) || !isfinite (kp->y) || !isfinite (kp->angle) ||
+          kp->x < -1 || kp->x > w + 1 || kp->y < -1 || kp->y > h + 1 ||
+          kp->angle < -0.01f || kp->angle > 2 * G_PI + 0.01f)
+        return NULL;
+    }
+
+  return g_steal_pointer (&f);
 }

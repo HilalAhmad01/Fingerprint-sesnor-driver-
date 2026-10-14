@@ -1,0 +1,6 @@
+#!/bin/sh
+# Called from PAM after a successful password login: clears the fingerprint
+# failure tally kept in the directory given as $1, which lifts a fingerprint
+# lockout. PAM_USER is set by pam_exec.
+[ -n "$1" ] && [ -n "$PAM_USER" ] || exit 1
+exec /usr/bin/faillock --dir "$1" --user "$PAM_USER" --reset
